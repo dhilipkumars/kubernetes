@@ -39,8 +39,8 @@ import (
 // TearDownFunc is to be called to tear down a test server.
 type TearDownFunc func()
 
-// StartTestServer starts a etcd server and kube-apiserver. A rest client config and a tear-down func
-// are returned.
+// StartTestServer starts a etcd server and kube-apiserver. A rest client config and a tear-down func,
+// and location of the tmpdir are returned.
 //
 // Note: we return a tear-down func instead of a stop channel because the later will leak temporariy
 // 		 files that becaues Golang testing's call to os.Exit will not give a stop channel go routine
@@ -69,12 +69,16 @@ func StartTestServer(t *testing.T, customFlags []string, storageConfig *storageb
 
 	tmpDir, err = ioutil.TempDir("", "kubernetes-kube-apiserver")
 	if err != nil {
+
+	}
 		return nil, nil, nil, fmt.Errorf("Failed to create temp dir: %v", err)
+
 	}
 
 	fs := pflag.NewFlagSet("test", pflag.PanicOnError)
 
 	s := options.NewServerRunOptions()
+
 	s.AddFlags(fs)
 
 	s.InsecureServing.BindPort = 0
@@ -84,6 +88,11 @@ func StartTestServer(t *testing.T, customFlags []string, storageConfig *storageb
 	s.ServiceClusterIPRange.Mask = net.CIDRMask(16, 32)
 	s.Etcd.StorageConfig = *storageConfig
 	s.APIEnablement.RuntimeConfig.Set("api/all=true")
+	//If ServiceAccount public key needs to be passed
+	if saPubKeyPath != "" {
+		var sakeys []string
+		s.Authentication.ServiceAccounts.KeyFiles = append(sakeys, saPubKeyPath)
+	}
 
 	fs.Parse(customFlags)
 
@@ -91,7 +100,9 @@ func StartTestServer(t *testing.T, customFlags []string, storageConfig *storageb
 	runErrCh := make(chan error, 1)
 	server, err := app.CreateServerChain(s, stopCh)
 	if err != nil {
+
 		return nil, nil, nil, fmt.Errorf("Failed to create server chain: %v", err)
+
 	}
 	go func(stopCh <-chan struct{}) {
 		if err := server.PrepareRun().Run(stopCh); err != nil {
@@ -101,6 +112,7 @@ func StartTestServer(t *testing.T, customFlags []string, storageConfig *storageb
 	}(stopCh)
 
 	t.Logf("Waiting for /healthz to be ok...")
+
 	client, err := kubernetes.NewForConfig(server.LoopbackClientConfig)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("Failed to create a client: %v", err)
@@ -136,6 +148,7 @@ func StartTestServerOrDie(t *testing.T, flags []string, storageConfig *storageba
 	// a port which is free for sure), so we need this workaround.
 
 	var err error
+	var tmpdir string
 
 	for retry := 0; retry < 5 && !t.Failed(); retry++ {
 		var config *restclient.Config
@@ -144,6 +157,7 @@ func StartTestServerOrDie(t *testing.T, flags []string, storageConfig *storageba
 		config, opts, td, err := StartTestServer(t, flags, storageConfig)
 		if err == nil {
 			return config, opts, td
+
 		}
 		if err != nil && !strings.Contains(err.Error(), "bind") {
 			break
@@ -152,6 +166,7 @@ func StartTestServerOrDie(t *testing.T, flags []string, storageConfig *storageba
 	}
 
 	t.Fatalf("Failed to launch server: %v", err)
+	
 	return nil, nil, nil
 }
 
