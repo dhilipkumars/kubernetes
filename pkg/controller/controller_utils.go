@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"sort"
 
 	"k8s.io/api/core/v1"
 	extensions "k8s.io/api/extensions/v1beta1"
@@ -1040,4 +1041,24 @@ func ComputeHash(template *v1.PodTemplateSpec, collisionCount *int32) uint32 {
 	}
 
 	return podTemplateSpecHasher.Sum32()
+}
+
+func GetPodKeys(pods []*v1.Pod) []string {
+	podKeys := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		podKeys = append(podKeys, PodKey(pod))
+	}
+	return podKeys
+}
+
+func GetPodsToDelete(filteredPods []*v1.Pod, diff int) []*v1.Pod {
+	// No need to sort pods if we are about to delete all of them.
+	// diff will always be <= len(filteredPods), so not need to handle > case.
+	if diff < len(filteredPods) {
+		// Sort the pods in the order such that not-ready < ready, unscheduled
+		// < scheduled, and pending < running. This ensures that we delete pods
+		// in the earlier stages whenever possible.
+		sort.Sort(ActivePods(filteredPods))
+	}
+	return filteredPods[:diff]
 }

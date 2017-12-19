@@ -1130,7 +1130,7 @@ func TestDeletePodOrphan(t *testing.T) {
 }
 
 type FakeJobExpectations struct {
-	*controller.ControllerExpectations
+	*controller.UIDTrackingControllerExpectations
 	satisfied    bool
 	expSatisfied func()
 }
@@ -1157,14 +1157,18 @@ func TestSyncJobExpectations(t *testing.T) {
 	podIndexer := sharedInformerFactory.Core().V1().Pods().Informer().GetIndexer()
 	podIndexer.Add(&pods[0])
 
-	manager.expectations = FakeJobExpectations{
-		controller.NewControllerExpectations(), true, func() {
+	fakeExpectations := &FakeJobExpectations {
+		controller.NewUIDTrackingControllerExpectations(controller.NewControllerExpectations()),
+		true,
+		func() {
 			// If we check active pods before checking expectataions, the job
 			// will create a new replica because it doesn't see this pod, but
 			// has fulfilled its expectations.
 			podIndexer.Add(&pods[1])
 		},
 	}
+
+	manager.expectations = fakeExpectations.UIDTrackingControllerExpectations
 	manager.syncJob(getKey(job, t))
 	if len(fakePodControl.Templates) != 0 {
 		t.Errorf("Unexpected number of creates.  Expected %d, saw %d\n", 0, len(fakePodControl.Templates))

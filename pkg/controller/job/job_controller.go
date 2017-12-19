@@ -20,9 +20,9 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"sort"
 	"sync"
 	"time"
+	"encoding/json"
 
 	batch "k8s.io/api/batch/v1"
 	"k8s.io/api/core/v1"
@@ -46,6 +46,8 @@ import (
 	"k8s.io/kubernetes/pkg/util/metrics"
 
 	"github.com/golang/glog"
+
+	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
 // controllerKind contains the schema.GroupVersionKind for this controller type.
@@ -53,9 +55,9 @@ var controllerKind = batch.SchemeGroupVersion.WithKind("Job")
 
 var (
 	// DefaultJobBackOff is the max backoff period, exported for the e2e test
-	DefaultJobBackOff = 10 * time.Second
+	DefaultJobBackOff = 1 * time.Second
 	// MaxJobBackOff is the max backoff period, exported for the e2e test
-	MaxJobBackOff = 360 * time.Second
+	MaxJobBackOff = 5 * time.Second
 )
 
 type JobController struct {
@@ -73,7 +75,7 @@ type JobController struct {
 	jobStoreSynced cache.InformerSynced
 
 	// A TTLCache of pod creates/deletes each rc expects to see
-	expectations controller.ControllerExpectationsInterface
+	expectations *controller.UIDTrackingControllerExpectations
 
 	// A store of jobs
 	jobLister batchv1listers.JobLister
@@ -103,24 +105,31 @@ func NewJobController(podInformer coreinformers.PodInformer, jobInformer batchin
 			KubeClient: kubeClient,
 			Recorder:   eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "job-controller"}),
 		},
-		expectations: controller.NewControllerExpectations(),
+		expectations: controller.NewUIDTrackingControllerExpectations(controller.NewControllerExpectations()),
 		queue:        workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(DefaultJobBackOff, MaxJobBackOff), "job"),
-		recorder:     eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "job-controller"}),
+		//queue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "job"),
+		recorder: eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "job-controller"}),
 	}
 
-	jobInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    jm.enqueueController,
-		UpdateFunc: jm.updateJob,
-		DeleteFunc: jm.enqueueController,
-	})
+	jobInformer.Informer().AddEventHandlerWithResyncPeriod(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    jm.addJob,
+			UpdateFunc: jm.updateJob,
+			DeleteFunc: jm.deleteJob,
+		},
+		10*time.Second,
+	)
 	jm.jobLister = jobInformer.Lister()
 	jm.jobStoreSynced = jobInformer.Informer().HasSynced
 
-	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    jm.addPod,
-		UpdateFunc: jm.updatePod,
-		DeleteFunc: jm.deletePod,
-	})
+	podInformer.Informer().AddEventHandlerWithResyncPeriod(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    jm.addPod,
+			UpdateFunc: jm.updatePod,
+			DeleteFunc: jm.deletePod,
+		},
+		30*time.Second,
+	)
 	jm.podStore = podInformer.Lister()
 	jm.podStoreSynced = podInformer.Informer().HasSynced
 
@@ -194,6 +203,7 @@ func (jm *JobController) addPod(obj interface{}) {
 	if pod.DeletionTimestamp != nil {
 		// on a restart of the controller controller, it's possible a new pod shows up in a state that
 		// is already pending deletion. Prevent the pod from being a creation observation.
+		glog.Infof("DHILIP: addPod() DeletionTimestamp=%v", pod.DeletionTimestamp)
 		jm.deletePod(pod)
 		return
 	}
@@ -238,6 +248,7 @@ func (jm *JobController) updatePod(old, cur interface{}) {
 		// and after such time has passed, the kubelet actually deletes it from the store. We receive an update
 		// for modification of the deletion timestamp and expect an job to create more pods asap, not wait
 		// until the kubelet actually deletes the pod.
+		glog.Infof("DHILIP: updatePod() DeletionTimestamp=%v", curPod.DeletionTimestamp)
 		jm.deletePod(curPod)
 		return
 	}
@@ -293,6 +304,7 @@ func (jm *JobController) deletePod(obj interface{}) {
 			utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a pod %+v", obj))
 			return
 		}
+		glog.Infof("DHILIP: deletePod() DeletedFinalStateUnknown or tombstone")
 	}
 
 	controllerRef := metav1.GetControllerOf(pod)
@@ -308,7 +320,9 @@ func (jm *JobController) deletePod(obj interface{}) {
 	if err != nil {
 		return
 	}
-	jm.expectations.DeletionObserved(jobKey)
+	glog.Infof("DHILIP: deletePod(%v)", jobKey)
+	glog.V(4).Infof("Pod %s/%s deleted through %v, timestamp %+v: %#v.", pod.Namespace, pod.Name, utilruntime.GetCaller(), pod.DeletionTimestamp, pod)
+	jm.expectations.DeletionObserved(jobKey, controller.PodKey(pod))
 	jm.enqueueController(job)
 }
 
@@ -316,11 +330,29 @@ func (jm *JobController) updateJob(old, cur interface{}) {
 	oldJob := cur.(*batch.Job)
 	curJob := cur.(*batch.Job)
 
-	// never return error
 	key, err := controller.KeyFunc(curJob)
 	if err != nil {
 		return
 	}
+
+	if reflect.DeepEqual(oldJob, curJob) {
+		glog.Infof("DHILIP: updateJob(%v) no update in the struct skipping..", key )
+		return
+	}
+
+	oldJobBytes , _ := json.MarshalIndent(oldJob, "", "  ")
+	curJobBytes , _ := json.MarshalIndent(curJob, "", "  ")
+
+	dmp := diffmatchpatch.New()
+
+	diffs := dmp.DiffMain(string(oldJobBytes), string(curJobBytes), false)
+
+
+
+	// never return error
+
+	glog.Infof("DHILIP: updateJob(%v) JOB DIFF %s", key, dmp.DiffPrettyText(diffs))
+	//glog.Infof("DHILIP: updateJob(%v)", key)
 	jm.enqueueController(curJob)
 	// check if need to add a new rsync for ActiveDeadlineSeconds
 	if curJob.Status.StartTime != nil {
@@ -341,6 +373,32 @@ func (jm *JobController) updateJob(old, cur interface{}) {
 	}
 }
 
+func (jm *JobController) deleteJob(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
+		return
+	}
+
+	glog.Infof("DHILIP: deleteJob(%v)", key)
+
+	jm.enqueueController(obj)
+
+}
+
+func (jm *JobController) addJob(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
+		return
+	}
+
+	glog.Infof("DHILIP: addJob(%v)", key)
+
+	jm.enqueueController(obj)
+
+}
+
 // obj could be an *batch.Job, or a DeletionFinalStateUnknown marker item.
 func (jm *JobController) enqueueController(job interface{}) {
 	key, err := controller.KeyFunc(job)
@@ -348,6 +406,7 @@ func (jm *JobController) enqueueController(job interface{}) {
 		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", job, err))
 		return
 	}
+	jm.queue.AddRateLimited(key)
 
 	// Retrieves the backoff duration for this Job
 	backoff := getBackoff(jm.queue, key)
@@ -358,7 +417,9 @@ func (jm *JobController) enqueueController(job interface{}) {
 	// all controllers there will still be some replica instability. One way to handle this is
 	// by querying the store for all controllers that this rc overlaps, as well as all
 	// controllers that overlap this rc, and sorting them.
-	jm.queue.AddAfter(key, backoff)
+	glog.Infof("DHILIP: enqueueController(%v) backoff=%v", key, backoff)
+	jm.queue.Add(key)
+	//jm.queue.AddAfter(key, backoff)
 }
 
 // worker runs a worker thread that just dequeues items, processes them, and marks them done.
@@ -423,6 +484,9 @@ func (jm *JobController) getPodsForJob(j *batch.Job) ([]*v1.Pod, error) {
 // it did not expect to see any more of its pods created or deleted. This function is not meant to be invoked
 // concurrently with the same key.
 func (jm *JobController) syncJob(key string) (bool, error) {
+
+	glog.Infof("DHILIP: syncJob(%v)", key)
+
 	startTime := time.Now()
 	defer func() {
 		glog.V(4).Infof("Finished syncing job %q (%v)", key, time.Now().Sub(startTime))
@@ -463,6 +527,18 @@ func (jm *JobController) syncJob(key string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	glog.Infof("DHILIP: syncJob(%v) previousRetry=%v jobNeedsSync=%v pods=%d", key, previousRetry, jobNeedsSync, len(pods))
+
+	if controlle, exists, _ := jm.expectations.GetExpectations(key); exists {
+		addExp, delExp := controlle.GetExpectations()
+
+		glog.Infof("DHILIP: syncJob(%v) addExpectation=%v removeExpectation=%v", key, addExp, delExp)
+
+	} else {
+
+		glog.Infof("DHILIP: syncJob(%v) expectation does not exist", key)
+
+	}
 
 	activePods := controller.FilterActivePods(pods)
 	active := int32(len(activePods))
@@ -479,6 +555,7 @@ func (jm *JobController) syncJob(key string) (bool, error) {
 			jm.queue.AddAfter(key, time.Duration(*job.Spec.ActiveDeadlineSeconds)*time.Second)
 		}
 	}
+	glog.Infof("DHILIP: syncJob(%v) activePods=%v succeed=%v failed=%d", key, active, succeeded, failed)
 
 	var manageJobErr error
 	jobFailed := false
@@ -498,7 +575,10 @@ func (jm *JobController) syncJob(key string) (bool, error) {
 		failureMessage = "Job was active longer than specified deadline"
 	}
 
+	glog.Infof("DHILIP: syncJob(%v) Deleting timestamp=%v", key, job.DeletionTimestamp)
+
 	if jobFailed {
+		glog.Infof("DHILIP: syncJob(%v) Deleting jobFailed=true reson=%v", key, failureReason)
 		errCh := make(chan error, active)
 		jm.deleteJobPods(&job, activePods, errCh)
 		select {
@@ -514,9 +594,13 @@ func (jm *JobController) syncJob(key string) (bool, error) {
 		active = 0
 		job.Status.Conditions = append(job.Status.Conditions, newCondition(batch.JobFailed, failureReason, failureMessage))
 		jm.recorder.Event(&job, v1.EventTypeWarning, failureReason, failureMessage)
+
 	} else {
+
 		if jobNeedsSync && job.DeletionTimestamp == nil {
+			glog.Infof("DHILIP: syncJob(%v) ManageJob activePods=%v succeeded=%v", key, active, succeeded)
 			active, manageJobErr = jm.manageJob(activePods, succeeded, &job)
+			glog.Infof("DHILIP: syncJob(%v) ManageJob activePods=%v manageJobErr=%v", key, active, manageJobErr)
 		}
 		completions := succeeded
 		complete := false
@@ -550,14 +634,18 @@ func (jm *JobController) syncJob(key string) (bool, error) {
 			now := metav1.Now()
 			job.Status.CompletionTime = &now
 		}
+		glog.Infof("DHILIP: syncJob(%v) complete=%v completions=%v job.Spec.Completions=%v", key, complete, completions, job.Spec.Completions)
 	}
 
 	forget := false
+	glog.Infof("DHILIP: syncJob(%v) job.Status.Active=%v job.Status.Succeeded=%v job.Status.Failed=%v len(job.Status.Conditions)=%v", key, job.Status.Active, job.Status.Succeeded, job.Status.Failed, len(job.Status.Conditions))
 	// no need to update the job if the status hasn't changed since last time
 	if job.Status.Active != active || job.Status.Succeeded != succeeded || job.Status.Failed != failed || len(job.Status.Conditions) != conditions {
 		job.Status.Active = active
 		job.Status.Succeeded = succeeded
 		job.Status.Failed = failed
+
+		glog.Infof("DHILIP: syncJob(%v) Update job.Status.Active=%v job.Status.Succeeded=%v job.Status.Failed=%v", key, job.Status.Active, job.Status.Succeeded, job.Status.Failed)
 
 		if err := jm.updateHandler(&job); err != nil {
 			return false, err
@@ -571,10 +659,22 @@ func (jm *JobController) syncJob(key string) (bool, error) {
 		forget = true
 	}
 
+	glog.Infof("DHILIP: syncJob(%v) Return forget=%v manageJobErr=%v", key, forget, manageJobErr)
+
 	return forget, manageJobErr
 }
 
 func (jm *JobController) deleteJobPods(job *batch.Job, pods []*v1.Pod, errCh chan<- error) {
+
+	jobKey, err := controller.KeyFunc(job)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("Couldn't get key for job %#v: %v", job, err))
+		return
+	}
+
+	jm.expectations.ExpectDeletions(jobKey, controller.GetPodKeys(pods))
+	glog.Infof("DHILIP: deleteJobPods() Deleting jobKey=%v, Pods=%d", jobKey, len(pods))
+
 	// TODO: below code should be replaced with pod termination resulting in
 	// pod failures, rather than killing pods. Unfortunately none such solution
 	// exists ATM. There's an open discussion in the topic in
@@ -591,6 +691,8 @@ func (jm *JobController) deleteJobPods(job *batch.Job, pods []*v1.Pod, errCh cha
 				defer utilruntime.HandleError(err)
 				glog.V(2).Infof("Failed to delete %v, job %q/%q deadline exceeded", pods[ix].Name, job.Namespace, job.Name)
 				errCh <- err
+				glog.Infof("DHILIP: deleteJobPods() Deleting pod failed JOB=%v, Pods=%v", jobKey, pods[ix].Name)
+				jm.expectations.DeletionObserved(jobKey, controller.PodKey(pods[ix]))
 			}
 		}(i)
 	}
@@ -644,12 +746,16 @@ func (jm *JobController) manageJob(activePods []*v1.Pod, succeeded int32, job *b
 	if active > parallelism {
 		diff := active - parallelism
 		errCh = make(chan error, diff)
-		jm.expectations.ExpectDeletions(jobKey, int(diff))
 		glog.V(4).Infof("Too many pods running job %q, need %d, deleting %d", jobKey, parallelism, diff)
 		// Sort the pods in the order such that not-ready < ready, unscheduled
 		// < scheduled, and pending < running. This ensures that we delete pods
 		// in the earlier stages whenever possible.
-		sort.Sort(controller.ActivePods(activePods))
+		//sort.Sort(controller.ActivePods(activePods))
+
+		podsToDelete := controller.GetPodsToDelete(activePods, int(diff))
+		//Record the the deletion based on the UID, which makes deletion much efficient and faster like RS
+		jm.expectations.ExpectDeletions(jobKey, controller.GetPodKeys(podsToDelete))
+		glog.Infof("DHILIP: Deleting jobKey=%v, Pods=%d", jobKey, len(podsToDelete))
 
 		active -= diff
 		wait := sync.WaitGroup{}
@@ -660,8 +766,8 @@ func (jm *JobController) manageJob(activePods []*v1.Pod, succeeded int32, job *b
 				if err := jm.podControl.DeletePod(job.Namespace, activePods[ix].Name, job); err != nil {
 					defer utilruntime.HandleError(err)
 					// Decrement the expected number of deletes because the informer won't observe this deletion
-					glog.V(2).Infof("Failed to delete %v, decrementing expectations for job %q/%q", activePods[ix].Name, job.Namespace, job.Name)
-					jm.expectations.DeletionObserved(jobKey)
+					glog.V(2).Infof("Failed to delete %v, decrementing expectations for job %q/%q err=%v", activePods[ix].Name, job.Namespace, job.Name, err)
+					jm.expectations.DeletionObserved(jobKey, controller.PodKey(activePods[ix]))
 					activeLock.Lock()
 					active++
 					activeLock.Unlock()
@@ -669,7 +775,16 @@ func (jm *JobController) manageJob(activePods []*v1.Pod, succeeded int32, job *b
 				}
 			}(i)
 		}
+		glog.Infof("DHILIP: Deleting jobKey=%v, Before wait.Wait()", jobKey)
 		wait.Wait()
+		glog.Infof("DHILIP: Deleting jobKey=%v, after wait.Wait()", jobKey)
+		err := jm.kubeClient.BatchV1().Jobs(job.Namespace).Delete(job.Name, nil)
+		if err != nil {
+			//Now that we have deleted all the pods of this job, lets try and delete the job itself
+			glog.Info("DHILIP: Error in Deleteing the JOB err=%v", err)
+			return 0, err
+		}
+
 
 	} else if active < parallelism {
 		wantActive := int32(0)
